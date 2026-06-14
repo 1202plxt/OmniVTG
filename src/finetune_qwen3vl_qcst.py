@@ -260,9 +260,12 @@ def main():
         video_embeds, deepstack_video_embeds = visual_out
         if state["query_tokens"] is not None:
             with torch.set_grad_enabled(st_module.training and model.training):
-                text_embeds = base_model.get_input_embeddings()(state["query_tokens"])
+                # state["query_tokens"] 已经是 embedding 输出 (1, L, text_dim)，直接用，不再过 embedding 层
                 video_embeds_refined = st_module(
-                    visual_tokens=video_embeds, text_tokens=text_embeds, num_frames=state["num_frames"])
+                    visual_tokens=video_embeds,
+                    text_tokens=state["query_tokens"],
+                    num_frames=state["num_frames"],
+                )
                 return video_embeds_refined, deepstack_video_embeds
         return visual_out
 
