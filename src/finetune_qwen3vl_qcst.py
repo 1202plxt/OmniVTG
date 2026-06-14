@@ -303,15 +303,36 @@ def main():
             query_txt = query_batch[0]
             score_str = score_str_batch[0]
 
-            # 构造对话：图像用 PIL Image，而不是 numpy 原地塞入 dict
-            # Qwen3-VL processor 内部解析 content 时要求每个 item 必须是纯 dict，不混 string
+            # 构造对话格式：多图像 + 文本
+            # Qwen3-VL 的 apply_chat_template 会自动处理图像占位符
             eval_prompt = SCORE_PROMPT.format(query_txt)
-            pil_images = [Image.fromarray(frames_np[i]) for i in range(args.num_frames)]
+            
+            # 构造 content：先放所有图像，再放文本
+            content = []
+            for i in range(args.num_frames):
+                content.append({
+                    "type": "image",
+                    "image": Image.fromarray(frames_np[i])
+                })
+            content.append({
+                "type": "text",
+                "text": eval_prompt
+            })
+            
+            messages = [{
+                "role": "user",
+                "content": content
+            }, {
+                "role": "assistant",
+                "content": score_str
+            }]
 
-            inputs = processor(
-                text=[eval_prompt],
-                images=[pil_images],
+            # 使用 apply_chat_template 自动处理图像占位符
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
                 return_tensors="pt",
+                return_dict=True
             ).to(model.device)
 
             # 1) tokenizer 输出 token ids，2) 过 embedding 层得到隐层，3) 传给 ST-Attention
