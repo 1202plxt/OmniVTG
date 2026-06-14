@@ -117,9 +117,19 @@ class QueryConditionedSTAttention(nn.Module):
 # Dataset：1 秒滑窗 + 软标签 1-10（保持原逻辑，但 __getitem__ 改为 tensor 输出）
 # ========================================================================
 class CharadesOnlineTrainDataset(Dataset):
-    def __init__(self, annotation_json, video_dir, num_frames=6):
+    def __init__(self, annotation_json, video_dir, num_frames=2, step_sec=2.0,
+                 window_sec=2.0, binary_threshold=5):
+        """
+        num_frames   : 每个滑窗抽几帧（原 6 → 改 2，视觉 token 减少 3 倍）
+        step_sec     : 滑窗步长秒（原 1.0 → 改 2.0，样本数减半）
+        window_sec   : 单滑窗持续秒数（与 step_sec 保持一致即可）
+        binary_threshold: overlap 映射到 1-10 后，>= 此值视为 positive
+        """
         self.video_dir = Path(video_dir)
         self.num_frames = num_frames
+        self.step_sec = float(step_sec)
+        self.window_sec = float(window_sec)
+        self.binary_threshold = int(binary_threshold)
 
         with open(annotation_json, "r", encoding="utf-8") as f:
             if annotation_json.endswith(".jsonl"):
@@ -131,7 +141,7 @@ class CharadesOnlineTrainDataset(Dataset):
         self._prepare_online_stream_samples()
 
     def _prepare_online_stream_samples(self):
-        print("⏳ 正在对齐流式时空时间戳，构建有监督软标签(Soft Label)样本...")
+        print(f"⏳ 正在构建滑窗样本 (step={self.step_sec}s, window={self.window_sec}s, frames={self.num_frames})...")
         for sample in self.samples:
             video_file = self.video_dir / os.path.basename(sample["video_file"])
             if not video_file.exists():
@@ -142,33 +152,39 @@ class CharadesOnlineTrainDataset(Dataset):
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = total_frames / fps if fps > 0 else 0
             cap.release()
-            if duration < 0.5:
+            if duration < self.window_sec * 0.5:
                 continue
 
             gt_windows = sample.get("relevant_windows", [])
             start_time = 0.0
 
             while start_time < duration:
-                end_time = min(start_time + 1.0, duration)
+                end_time = min(start_time + self.window_sec, duration)
                 max_overlap = 0.0
                 for gt_s, gt_e in gt_windows:
                     inter_s = max(start_time, gt_s)
                     inter_e = min(end_time, gt_e)
                     inter_len = max(0.0, inter_e - inter_s)
                     if inter_len > 0:
-                        max_overlap = max(max_overlap, inter_len / 1.0)
+                        max_overlap = max(max_overlap, inter_len / self.window_sec)
 
-                target_score = int(np.round(max_overlap * 9 + 1))
+                score_1_10 = int(np.round(max_overlap * 9 + 1))
+                # 二值化：直接训练模型做「是否命中 relevant window」的判断
+                label = "Yes" if score_1_10 >= self.binary_threshold else "No"
+
                 self.flattened_windows.append({
                     "video_path": video_file,
                     "start": start_time,
-                    "end": end_time,
+                    "end":   end_time,
                     "query": sample["query"],
-                    "target_score": target_score,
+                    "label": label,
+                    "score": score_1_10,
                 })
-                start_time += 1.0
+                start_time += self.step_sec
 
-        print(f"✅ 流式样本构建完成，总计训练滑窗样本数: {len(self.flattened_windows)}")
+        n_pos = sum(1 for w in self.flattened_windows if w["label"] == "Yes")
+        print(f"✅ 样本构建完成：总计 {len(self.flattened_windows)} 个滑窗 "
+              f"(positive {n_pos} / negative {len(self.flattened_windows) - n_pos})")
 
     def __len__(self):
         return len(self.flattened_windows)
@@ -194,49 +210,42 @@ class CharadesOnlineTrainDataset(Dataset):
             frames.append(frame)
         cap.release()
 
-        # (T, H, W, C) -> (T, C, H, W)
         frames_np = np.stack(frames, axis=0).astype(np.uint8)
-        return frames_np, meta["query"], meta["target_score"]
+        return frames_np, meta["query"], meta["label"]
 
 
 # ========================================================================
 # 训练主循环
 # ========================================================================
-def build_prompt_and_messages(frames_np, query_txt, score_val, num_frames):
-    """
-    构造 Qwen3-VL 对话格式：
-        user: <image>...<image>  + 评分指令
-        assistant: 数字(1~10)
-    返回 processor.apply_chat_template 的 **kwargs。
-    """
-    eval_prompt = (
-        "Evaluate the semantic-visual alignment between the following action query "
-        "and the current 1-second video frames.\n"
-        f'Query: "{query_txt}"\n'
-        "Task: Rate the alignment score on a scale from 1 (completely irrelevant) to 10 (perfectly matched).\n"
-        "Output ONLY the single score integer. Do not output any explanation.\n"
-        "Score:"
-    )
+SHORT_PROMPT = (
+    'Does this video snippet match the query "{}"? '
+    "Answer Yes or No only."
+)
 
-    # 构造多图像消息：Qwen3-VL 支持多 image 块，这里我们把每帧作为一张图送入
-    user_content = []
-    for _ in range(num_frames):
-        user_content.append({"type": "image", "image": None})
-    user_content.append({"type": "text", "text": eval_prompt})
 
-    messages = [
+def build_prompt_and_messages(query_txt, label, num_frames):
+    """
+    极简版：instruction 只保留必要信息，assistant 只输出 "Yes" / "No" 一个单词。
+    token 数量 ↓ → LLM 前向更快。
+    """
+    user_content = [{"type": "image"} for _ in range(num_frames)]
+    user_content.append({"type": "text", "text": SHORT_PROMPT.format(query_txt)})
+
+    return [
         {"role": "user", "content": user_content},
-        {"role": "assistant", "content": str(score_val)},
+        {"role": "assistant", "content": label},
     ]
-    return messages
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多模态大模型双卡 LoRA + 基于查询的时空注意力 评分微调管线")
+    parser = argparse.ArgumentParser(description="极简版：基于查询的时空注意力 + 二元 Yes/No 判断微调")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--video_dir", type=str, required=True)
     parser.add_argument("--annotation_json", type=str, required=True)
-    parser.add_argument("--num_frames", type=int, default=6)
+    parser.add_argument("--num_frames", type=int, default=2,    help="每滑窗抽几帧（建议 2）")
+    parser.add_argument("--step_sec",   type=float, default=2.0, help="滑窗步长秒（建议 2）")
+    parser.add_argument("--window_sec", type=float, default=2.0, help="单滑窗持续秒数")
+    parser.add_argument("--binary_threshold", type=int, default=5, help="1-10 score 超过则记 Yes")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--st_lr", type=float, default=1e-4, help="时空注意力模块的学习率（略大于基座 LoRA）")
@@ -345,13 +354,18 @@ def main():
     # ------------------------------------------------------------
     # 7) 数据
     # ------------------------------------------------------------
-    dataset = CharadesOnlineTrainDataset(args.annotation_json, args.video_dir, num_frames=args.num_frames)
+    dataset = CharadesOnlineTrainDataset(
+        args.annotation_json, args.video_dir,
+        num_frames=args.num_frames,
+        step_sec=args.step_sec, window_sec=args.window_sec,
+        binary_threshold=args.binary_threshold,
+    )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
 
     # ------------------------------------------------------------
-    # 8) 训练 loop
+    # 8) 训练 loop —— 目标从 1-10 评分退化为 Yes/No 判断
+    #    - 文本序列短 → 每个 step 的 LLM 前向显著变短
     # ------------------------------------------------------------
-    embed_tokens = base_model.get_input_embeddings()
     print("\n==================== 🏁 启动有监督协同微调 ====================")
     for epoch in range(args.epochs):
         model.train()
@@ -359,21 +373,18 @@ def main():
         epoch_loss = 0.0
         n_steps = 0
 
-        for step, (frames_batch, query_batch, target_score_batch) in enumerate(dataloader):
+        for step, (frames_batch, query_batch, label_batch) in enumerate(dataloader):
             optimizer.zero_grad()
 
-            # frames_batch: (1, T, H, W, C)  -> (T, H, W, C)
+            # frames_batch: (1, T, H, W, C) -> (T, H, W, C)
             frames_np = frames_batch[0].numpy()
             query_txt = query_batch[0]
-            score_val = int(target_score_batch[0].item())
+            label_txt = label_batch[0]  # "Yes" / "No"
 
-            # 把每帧作为一张 image 输入给 processor.apply_chat_template
-            messages = build_prompt_and_messages(frames_np, query_txt, score_val, args.num_frames)
-
-            # 准备 image list: Qwen3-VL processor 需要 numpy (H,W,3)
+            # 1) 构造对话格式 + 填图像
+            messages = build_prompt_and_messages(query_txt, label_txt, args.num_frames)
             image_list = [frames_np[i] for i in range(args.num_frames)]
 
-            # 填充 None 占位图为真正图像
             for m_i, msg in enumerate(messages):
                 if msg["role"] == "user":
                     new_content = []
@@ -386,8 +397,7 @@ def main():
                             new_content.append(item)
                     messages[m_i]["content"] = new_content
 
-            # --- 准备 q_text：从纯查询文本得到 token 序列 —— 用于「探照灯」 ---
-            # 直接用 processor.tokenizer 编码 query 即可
+            # 2) q_text：供 query-conditioned ST attention 使用的隐层特征
             q_ids = processor.tokenizer(
                 query_txt, return_tensors="pt", add_special_tokens=False
             )["input_ids"].to(model.device)
@@ -396,18 +406,16 @@ def main():
 
             try:
                 inputs = processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
+                    messages, tokenize=True,
                     add_generation_prompt=False,
-                    return_dict=True,
-                    return_tensors="pt",
+                    return_dict=True, return_tensors="pt",
                 ).to(model.device)
 
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    # 监督掩码：仅对 assistant 输出的分数 token 计算 loss
                     labels = inputs["input_ids"].clone()
-                    # 简单策略：将除最后 2~3 个 token 外全部 mask
-                    mask_len = max(2, labels.shape[1] - 3)
+                    # 极简 labels 只有 1–2 个 token（"Yes"/"No"）
+                    # 稳妥起见保留最后 3 个位置不 mask（BOS/EOS 也可能多算但不影响梯度）
+                    mask_len = max(1, labels.shape[1] - 3)
                     labels[:, :mask_len] = -100
 
                     outputs = model(**inputs, labels=labels)
@@ -418,33 +426,26 @@ def main():
                 epoch_loss += loss.item()
                 n_steps += 1
 
-                if (step + 1) % 10 == 0:
+                if (step + 1) % 20 == 0:
                     print(
                         f"Epoch [{epoch+1}/{args.epochs}] | Step [{step+1}/{len(dataloader)}] "
-                        f"| 🎯 真实标签: {score_val} | Loss: {loss.item():.4f}",
-                        flush=True,
+                        f"| gt={label_txt} | Loss={loss.item():.4f}", flush=True,
                     )
             except Exception as e:
                 print(f"⚠️ 训练步长抖动保护: {str(e)}", flush=True)
                 torch.cuda.empty_cache()
                 continue
             finally:
-                # 清理 step 级临时缓存
                 state["query_tokens"] = None
                 if (step + 1) % 50 == 0:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # 每 Epoch 保存一次
         avg_loss = epoch_loss / max(1, n_steps)
         epoch_save_path = Path(args.save_dir) / f"epoch_{epoch+1}"
         model.save_pretrained(epoch_save_path)
-        st_state_path = epoch_save_path / "query_st_attention.pt"
-        torch.save(st_module.state_dict(), st_state_path)
-        print(
-            f"💾 Epoch {epoch+1} 训练完毕。LoRA 权重 + 时空注意力权重 已落盘至: "
-            f"{epoch_save_path} | 平均损失: {avg_loss:.4f}"
-        )
+        torch.save(st_module.state_dict(), epoch_save_path / "query_st_attention.pt")
+        print(f"💾 Epoch {epoch+1} 完成 | 平均 Loss={avg_loss:.4f} | 保存至 {epoch_save_path}")
 
 
 if __name__ == "__main__":
