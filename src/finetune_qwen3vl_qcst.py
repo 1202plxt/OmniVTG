@@ -35,13 +35,15 @@ class QueryConditionedSTAttention(nn.Module):
         self.scale = nn.Parameter(torch.zeros(1))  # 残差门控，保证初始稳定性
 
     def forward(self, visual_tokens: torch.Tensor, text_tokens: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """
+        text_tokens: 来自 LLM embedding 层的输出，形状 (1, L, text_dim)
+        """
         total_tokens, v_dim = visual_tokens.shape
         tokens_per_frame = total_tokens // num_frames
 
-        # 1) 跨模态投影
-        v_hid = self.vision_proj(visual_tokens)
-        q_text_seq = self.text_proj(text_tokens)
-        q_text = q_text_seq.mean(dim=1, keepdim=True)  # (1, 1, H) - 提取全局 Query 探照灯
+        # 1) 跨模态投影：两个输入都已经是 hidden_dim 维，统一投影到注意力空间
+        v_hid = self.vision_proj(visual_tokens)          # (N, H)
+        q_text_seq = self.text_proj(text_tokens.mean(dim=1))  # (1, 1, text_dim) -> mean -> (1, text_dim) -> proj -> (1, H)
 
         # 2) 空间 Cross-Attention (基于文本筛选视觉)
         v_frames = v_hid.view(num_frames, tokens_per_frame, -1)
@@ -308,10 +310,11 @@ def main():
                 return_tensors="pt",
             ).to(model.device)
 
-            # 将 query 转为 token 序列注入时空注意力
+            # 1) tokenizer 输出 token ids，2) 过 embedding 层得到隐层，3) 传给 ST-Attention
             q_ids = processor.tokenizer(
                 query_txt, return_tensors="pt", add_special_tokens=False)["input_ids"].to(model.device)
-            state["query_tokens"] = q_ids
+            text_embeds = base_model.get_input_embeddings()(q_ids)  # (1, L, text_dim)
+            state["query_tokens"] = text_embeds  # ← 存的是 embedding，不是 token ids
             state["num_frames"] = args.num_frames
 
             try:
