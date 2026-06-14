@@ -241,9 +241,10 @@ def main():
     lora_config = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type=TaskType.CAUSAL_LM)
     model = get_peft_model(model, lora_config)
 
-    # 修 2: text_config.hidden_size 而不是顶层 hidden_size
+    # 修 2: 视觉编码器输出经过 merger 后维度等于 text_config.hidden_size（4096）
+    # 所以 vision_proj 和 text_proj 的输入维度都是 4096
     st_module = QueryConditionedSTAttention(
-        vision_dim=model.config.vision_config.hidden_size,
+        vision_dim=model.config.text_config.hidden_size,  # ← 改成 text_config.hidden_size
         text_dim=model.config.text_config.hidden_size,
         hidden_dim=1024, num_heads=8,
     ).to(model.device, dtype=torch.bfloat16)
