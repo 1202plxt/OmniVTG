@@ -41,9 +41,9 @@ class QueryConditionedSTAttention(nn.Module):
         total_tokens, v_dim = visual_tokens.shape
         tokens_per_frame = total_tokens // num_frames
 
-        # 1) 跨模态投影：两个输入都已经是 hidden_dim 维，统一投影到注意力空间
+        # 1) 跨模态投影
         v_hid = self.vision_proj(visual_tokens)          # (N, H)
-        q_text_seq = self.text_proj(text_tokens.mean(dim=1))  # (1, 1, text_dim) -> mean -> (1, text_dim) -> proj -> (1, H)
+        q_text = self.text_proj(text_tokens.mean(dim=1, keepdim=True))  # (1, 1, text_dim) -> proj -> (1, 1, H)
 
         # 2) 空间 Cross-Attention (基于文本筛选视觉)
         v_frames = v_hid.view(num_frames, tokens_per_frame, -1)
