@@ -10,6 +10,7 @@ import os
 import gc
 from pathlib import Path
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from PIL import Image  # 新增
 from peft import LoraConfig, get_peft_model, TaskType
 
 warnings.filterwarnings("ignore")
@@ -211,15 +212,6 @@ SCORE_PROMPT = (
 )
 
 
-def build_prompt_and_messages(query_txt, score_str, num_frames):
-    user_content = [{"type": "image"} for _ in range(num_frames)]
-    user_content.append({"type": "text", "text": SCORE_PROMPT.format(query_txt)})
-    return [
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": score_str}
-    ]
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
@@ -305,33 +297,34 @@ def main():
             query_txt = query_batch[0]
             score_str = score_str_batch[0]
 
-            messages = build_prompt_and_messages(query_txt, score_str, args.num_frames)
+            # 构造对话：图像用 PIL Image，而不是 numpy 原地塞入 dict
+            # Qwen3-VL processor 内部解析 content 时要求每个 item 必须是纯 dict，不混 string
+            eval_prompt = SCORE_PROMPT.format(query_txt)
+            pil_images = [Image.fromarray(frames_np[i]) for i in range(args.num_frames)]
 
-            # 把 numpy 图像塞进 messages
-            for msg in messages:
-                if msg["role"] == "user":
-                    img_idx = 0
-                    for item in msg["content"]:
-                        if item["type"] == "image":
-                            item["image"] = frames_np[img_idx]
-                            img_idx += 1
+            inputs = processor(
+                text=[eval_prompt],
+                images=[pil_images],
+                return_tensors="pt",
+            ).to(model.device)
 
-            # Query Token 注入 —— 供底层时空注意力的 Query
-            state["query_tokens"] = processor.tokenizer(
+            # 将 query 转为 token 序列注入时空注意力
+            q_ids = processor.tokenizer(
                 query_txt, return_tensors="pt", add_special_tokens=False)["input_ids"].to(model.device)
+            state["query_tokens"] = q_ids
             state["num_frames"] = args.num_frames
 
             try:
-                inputs = processor.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=False,
-                    return_dict=True, return_tensors="pt").to(model.device)
+                # 对齐 labels：prompt 部分的 token 不参与 loss 计算
+                # Qwen3VL processor 返回的 input_ids 顺序为：文本 tokens + 视觉 patch tokens
+                # 视觉 token 在文本 tokens 之后，我们 mask 掉前面的文本部分
+                labels = inputs["input_ids"].clone()
+                text_len = q_ids.shape[1]  # query 长度
+                # mask 掉前面的文本 token（prompt + query），只监督最后几个数字 token
+                mask_len = max(2, labels.shape[1] - 3)
+                labels[:, :mask_len] = -100
 
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    labels = inputs["input_ids"].clone()
-                    # 监督掩码：屏蔽 Prompt，仅对最后的数字进行梯度计算
-                    mask_len = max(2, labels.shape[1] - 4)
-                    labels[:, :mask_len] = -100
-
                     outputs = model(**inputs, labels=labels)
                     loss = outputs.loss
 
@@ -341,12 +334,13 @@ def main():
 
                 if (step + 1) % 10 == 0:
                     print(
-                        f"Epoch [{epoch+1}/{args.epochs}] | Step [{step+1}/{len(dataloader)}] | gt={score_str} | Loss={loss.item():.4f}",
-                        flush=True,
+                        f"Epoch [{epoch+1}/{args.epochs}] | Step [{step+1}/{len(dataloader)}] | "
+                        f"gt={score_str} | Loss={loss.item():.4f}", flush=True,
                     )
 
             except Exception as e:
                 print(f"⚠️ 步长保护: {str(e)}", flush=True)
+                import traceback; traceback.print_exc()
                 torch.cuda.empty_cache()
                 continue
             finally:
