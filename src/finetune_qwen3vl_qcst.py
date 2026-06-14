@@ -304,10 +304,8 @@ def main():
             score_str = score_str_batch[0]
 
             # 构造对话格式：多图像 + 文本
-            # Qwen3-VL 的 apply_chat_template 会自动处理图像占位符
             eval_prompt = SCORE_PROMPT.format(query_txt)
-            
-            # 构造 content：先放所有图像，再放文本
+
             content = []
             for i in range(args.num_frames):
                 content.append({
@@ -318,23 +316,39 @@ def main():
                 "type": "text",
                 "text": eval_prompt
             })
-            
-            messages = [{
-                "role": "user",
-                "content": content
-            }, {
-                "role": "assistant",
-                "content": score_str
-            }]
 
-            # 使用 apply_chat_template 自动处理图像占位符
-            inputs = processor.apply_chat_template(
-                messages,
-                tokenize=True,  # ← 必须加这个参数，否则返回字符串
-                add_generation_prompt=False,
+            # 1) 只 tokenize user prompt（含图像 + instruction），add_generation_prompt 自动追加 "assistant\n"
+            user_inputs = processor.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=True,
+                add_generation_prompt=True,
                 return_tensors="pt",
-                return_dict=True
+                return_dict=True,
             ).to(model.device)
+
+            # 2) 单独 tokenize assistant 目标答案
+            assistant_ids = processor.tokenizer(
+                score_str, return_tensors="pt", add_special_tokens=False
+            )["input_ids"].to(model.device)
+
+            # 3) 拼接 input_ids / attention_mask
+            input_ids = torch.cat([user_inputs["input_ids"], assistant_ids], dim=1)
+            attention_mask = torch.cat(
+                [user_inputs["attention_mask"], torch.ones_like(assistant_ids)], dim=1
+            )
+
+            # 4) labels：user 部分全部 mask (-100)，仅 assistant 部分参与 loss
+            labels = torch.cat(
+                [torch.full_like(user_inputs["input_ids"], -100), assistant_ids], dim=1
+            )
+
+            inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "pixel_values": user_inputs.get("pixel_values"),
+                "image_grid_thw": user_inputs.get("image_grid_thw"),
+            }
 
             # 1) tokenizer 输出 token ids，2) 过 embedding 层得到隐层，3) 传给 ST-Attention
             q_ids = processor.tokenizer(
@@ -344,17 +358,8 @@ def main():
             state["num_frames"] = args.num_frames
 
             try:
-                # 对齐 labels：prompt 部分的 token 不参与 loss 计算
-                # Qwen3VL processor 返回的 input_ids 顺序为：文本 tokens + 视觉 patch tokens
-                # 视觉 token 在文本 tokens 之后，我们 mask 掉前面的文本部分
-                labels = inputs["input_ids"].clone()
-                text_len = q_ids.shape[1]  # query 长度
-                # mask 掉前面的文本 token（prompt + query），只监督最后几个数字 token
-                mask_len = max(2, labels.shape[1] - 3)
-                labels[:, :mask_len] = -100
-
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = model(**inputs, labels=labels)
+                    outputs = model(**inputs)
                     loss = outputs.loss
 
                 loss.backward()
