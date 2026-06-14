@@ -330,6 +330,7 @@ def main():
             # 使用 apply_chat_template 自动处理图像占位符
             inputs = processor.apply_chat_template(
                 messages,
+                tokenize=True,  # ← 必须加这个参数，否则返回字符串
                 add_generation_prompt=False,
                 return_tensors="pt",
                 return_dict=True
